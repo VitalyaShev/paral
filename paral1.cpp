@@ -1,5 +1,7 @@
 #include <iostream>
 #include <stdlib.h>
+#include "cublas_v2.h"
+#include <cuda_runtime.h>
 
 using namespace std;
 
@@ -7,7 +9,7 @@ int main() {
 	int iter;
 	double acc = 0.000001; 
 	double err = 1;
-	int n = 1024; 
+	int n = 256; 
 	int iters = 1000000; 
 	double step = 10. / (double)(n);
 	iter = 0;
@@ -31,21 +33,49 @@ int main() {
 			for (int j = 1; j < n - 1; j++)
 				arr[i][j] = 0;
 	}
-#pragma	acc data copy(arr) create(arr1, err)
+	cublasHandle_t handle;
+    cublasCreate(&handle);
+    double temp[n*n];
+#pragma	acc data copy(arr) create(arr1, err, temp)
 	{
+        #pragma acc kernels
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+            arr1[i][j] = arr[i][j];
 		while ((err > acc) && (iter < iters)) {
 			iter++;		
 			if ((iter % 100 == 0) || (iter == 1)){ // every 100 iterations we nullify error and compute it
             #pragma acc kernels async(1) // asynchronous computations on a new thread
             {
             err = 0;
-            #pragma acc loop independent collapse(2) reduction(max:err) // collapsing double for into one
             for (int j = 1; j < n-1; j++)
-                for (int i = 1; i < n-1; i++){
+                for (int i = 1; i < n-1; i++)
                     arr1[i][j] = arr[i][j] + 1./(double)(n*n*4) * ((arr[i - 1][j] - 2 * arr[i][j] + arr[i + 1][j]) + (arr[i][j - 1] - 2 * arr[i][j] + arr[i][j + 1])) / (h * h);
-                    err = max(err, arr1[i][j] - arr[i][j]);
-                }
             }
+			#pragma acc wait(1)
+            int idx;
+            //making addresses of device data avaiable on the host
+            #pragma acc host_data use_device(arr1, arr, temp)
+            {
+            // here we will be implementing the following expression:
+            //  err = max(err, Anew[i][j] - A[i][j]);
+            double alpha = -1.;
+            for (int i = 0; i < n; i++){
+                // copying Anew matrix to a cublas-like array temp
+                cublasDcopy(handle, n, arr1[i], 1, &temp[i*n], 1);
+                // multiplying A matrix with -1 and adding it to temp
+                cublasDaxpy(handle, n, &alpha, arr[i], 1, &temp[i*n], 1);
+            }
+            
+            // searching for a max error
+            cublasIdamax(handle, n*n, temp, 1, &idx);
+            }
+            
+            // updating temp on CPU
+            #pragma acc update self(temp[idx-1:1])
+            
+            // getting the result
+            err = fabs(temp[idx-1]);
         } 
 		else{
             #pragma acc kernels async(1)
@@ -59,12 +89,9 @@ int main() {
         for (int i = 1; i < n - 1; i++)
             for (int j = 1; j < n - 1; j++)
                 arr[i][j] = arr1[i][j];
-		if ((iter % 100 == 0) || (iter == 1)){ // every 100 iterations:
-        #pragma acc wait(1) // synchronizing all threads
-        #pragma acc update self(err) // updating error value on CPU
 		}
 	}
-	}
 	cout << iter << ' ' << err;
+    cublasDestroy(handle);
 	return 0;
 }
